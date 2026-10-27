@@ -9,14 +9,14 @@ args:
     required: true
   scope:
     type: string
-    description: 可选：只读勘察范围，换行/逗号分隔的目录或文件；空则让勘察员提出分片。
+    description: 可选：只读勘察范围，换行/逗号分隔的目录或文件，最多 12 项；空则让勘察员提出分片。
   planPath:
     type: string
-    description: 可选：计划输出路径，默认 plan.md。
+    description: 可选：计划输出路径，默认 plan.md；必须是规范化 workspace 相对 .md，不能覆盖非计划文件或已批准计划。
     default: plan.md
   acceptance:
     type: string
-    description: 可选：验收命令，换行分隔；空则自动探测。
+    description: 可选：验收命令，换行分隔；路径参数必须留在 workspace 内；空则自动探测。
   constraints:
     type: string
     description: 可选：共享文件、最大批次、禁止改动、必须保留的 API 等。
@@ -191,14 +191,20 @@ interface PlanReview {
 }
 
 function normalizePlanReview(review: PlanReview): PlanReview {
+  const summary = review.summary.trim() ? review.summary : "独立评审未提供摘要。";
   const hasBlockingConcerns =
     review.issues.some((issue) => issue.severity === "high") ||
     review.missing.length > 0 ||
     review.scopeConcerns.length > 0 ||
     review.acceptanceConcerns.length > 0;
-  return hasBlockingConcerns && review.verdict === "approve"
-    ? { ...review, verdict: "revise" }
-    : review;
+  if (hasBlockingConcerns && review.verdict === "approve") {
+    return {
+      ...review,
+      verdict: "revise",
+      summary: `${summary} 确定性校验发现阻塞性评审项，verdict 已降级为 revise。`,
+    };
+  }
+  return summary === review.summary ? review : { ...review, summary };
 }
 
 interface PlanReport {
@@ -220,31 +226,30 @@ interface PlanReport {
   detectedAcceptance: string[];
   /** Recon shards that failed, with the reason. */
   reconFailures: string[];
-  /** True only when the on-disk plan exactly matches the generated content. */
+  /** User constraints supplied for this plan. */
+  constraints: string;
+  /** User-specified recon scope; empty when the scout chose it. */
+  scope: string;
+  /** Write failure detail; empty when the plan was written successfully. */
+  planWriteError: string;
+  /** True only when the on-disk plan matches the generated content, ignoring line-ending style. */
   planWritten: boolean;
 }
 
 const requirement = String(args.requirement ?? "").trim();
 const scopeArg = String(args.scope ?? "").trim();
-const planPath = (String(args.planPath ?? "plan.md").trim() || "plan.md")
-  .replace(/\\/g, "/")
-  .replace(/^\.\//, "");
+const planPathCandidate = canonicalPath(String(args.planPath ?? "plan.md").trim() || "plan.md");
 const acceptanceArg = String(args.acceptance ?? "").trim();
 const extraConstraints = String(args.constraints ?? "").trim();
 const language = String(args.language ?? "中文").trim();
 
 if (!requirement) throw new Error("task-plan: args.requirement is required");
-if (
-  /^[A-Za-z]:[\\/]/.test(planPath) ||
-  planPath.startsWith("/") ||
-  planPath.startsWith("\\\\") ||
-  planPath.split("/").some((part) => part === ".." || part.toLowerCase() === ".git") ||
-  planPath === "." ||
-  planPath.endsWith("/") ||
-  !validRepoPath(planPath)
-) {
-  throw new Error("task-plan: args.planPath must be workspace-relative");
+if (!planPathCandidate || !planPathCandidate.toLowerCase().endsWith(".md")) {
+  throw new Error("task-plan: args.planPath must be a workspace-relative .md file");
 }
+const planPath = planPathCandidate;
+let existingPlanContent = "";
+let planFileExists = false;
 
 function splitScope(value: string): string[] {
   return value
@@ -284,6 +289,20 @@ function stableJson(value: unknown): string {
     .join(",")}}`;
 }
 
+function containsReservedMarker(value: unknown): boolean {
+  if (typeof value === "string") {
+    return value.includes("TASK_RUN_CONTRACT_START") || value.includes("TASK_RUN_CONTRACT_END");
+  }
+  if (Array.isArray(value)) return value.some(containsReservedMarker);
+  if (isRecord(value)) return Object.values(value).some(containsReservedMarker);
+  return false;
+}
+
+function samePlanText(left: string, right: string): boolean {
+  const normalize = (value: string) => value.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+  return normalize(left) === normalize(right);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -298,18 +317,45 @@ function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
+function canonicalPath(value: string): string | null {
+  const normalized = value.replace(/\\/g, "/");
+  if (!normalized || normalized !== normalized.trim()) return null;
+  if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) return null;
+  let path = normalized;
+  while (path.startsWith("./")) path = path.slice(2);
+  if (!path || path === "." || path.endsWith("/")) return null;
+  if (path.startsWith("!") || path.startsWith(":")) return null;
+  const parts = path.split("/");
+  if (
+    parts.some(
+      (part) =>
+        !part ||
+        part === "." ||
+        part === ".." ||
+        part.toLowerCase() === ".git" ||
+        part.includes(":") ||
+        /[. ]$/.test(part),
+    )
+  ) {
+    return null;
+  }
+  if (
+    path.split("").some((character) => {
+      const code = character.charCodeAt(0);
+      return code === 0 || code === 10 || code === 13 || "*?[]{}".includes(character);
+    })
+  ) {
+    return null;
+  }
+  return path;
+}
+
 function validRepoPath(path: string): boolean {
-  const normalized = path.replace(/\\/g, "/");
-  return Boolean(
-    normalized &&
-      !normalized.startsWith("/") &&
-      !/^[A-Za-z]:/.test(normalized) &&
-      !normalized.split("/").some((part) => part === ".." || part.toLowerCase() === ".git") &&
-      !normalized.split("").some((character) => {
-        const code = character.charCodeAt(0);
-        return code === 0 || code === 10 || code === 13 || "*?[]{}".includes(character);
-      }),
-  );
+  return canonicalPath(path) !== null;
+}
+
+function validReconPath(path: string): boolean {
+  return path === "." || validRepoPath(path);
 }
 
 function hasControlChars(value: string): boolean {
@@ -319,10 +365,23 @@ function hasControlChars(value: string): boolean {
   });
 }
 
+function safeRelativeArgument(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/");
+  return (
+    !normalized.startsWith("/") &&
+    !/^[A-Za-z]:/.test(normalized) &&
+    !normalized.split("/").some((part) => part === ".." || part.split("=").some((item) => item === ".."))
+  );
+}
+
 function pathIsWithin(path: string, scope: string): boolean {
-  const candidate = path.replace(/\\/g, "/").replace(/^\.\//, "");
-  const normalizedScope = scope.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-  return normalizedScope === "." || candidate === normalizedScope || candidate.startsWith(`${normalizedScope}/`);
+  const candidate = canonicalPath(path);
+  const normalizedScope = canonicalPath(scope);
+  return (
+    candidate !== null &&
+    normalizedScope !== null &&
+    (candidate === normalizedScope || candidate.startsWith(`${normalizedScope}/`))
+  );
 }
 
 function validAcceptanceCommand(value: unknown): value is AcceptanceCommand {
@@ -339,14 +398,14 @@ function validAcceptanceCommand(value: unknown): value is AcceptanceCommand {
     case "go":
       return commandArgs.length >= 2 && ["test", "build"].includes(commandArgs[0]) && commandArgs.slice(1).every(
         (item) => ["-race", "-cover", "-v", "-count=1", "./..."].includes(item) ||
-          (/^[A-Za-z0-9_./*]+$/.test(item) && !item.split("/").includes("..") && !item.startsWith("-")),
+          (safeRelativeArgument(item) && /^[A-Za-z0-9_./*]+$/.test(item) && !item.split("/").includes("..") && !item.startsWith("-")),
       );
     case "cargo":
       return commandArgs.length >= 1 && ["test", "build", "clippy"].includes(commandArgs[0]) && commandArgs.slice(1).every(
         (item) => ["--workspace", "--all-targets", "--all-features", "--locked"].includes(item),
       );
     case "pytest":
-      return commandArgs.every((item) => ["-q", "-v", "--quiet", "--strict-markers"].includes(item) || /^[A-Za-z0-9_./:-]+$/.test(item));
+      return commandArgs.every((item) => ["-q", "-v", "--quiet", "--strict-markers"].includes(item) || (safeRelativeArgument(item) && /^[A-Za-z0-9_./:-]+$/.test(item)));
     case "mvn":
       return commandArgs.length === 1 && ["test", "verify", "package"].includes(commandArgs[0]);
     case "gradle":
@@ -356,7 +415,7 @@ function validAcceptanceCommand(value: unknown): value is AcceptanceCommand {
     case "make":
       return commandArgs.length === 1 && ["test", "check", "build", "lint"].includes(commandArgs[0]);
     case "dotnet":
-      return commandArgs.length >= 1 && ["test", "build"].includes(commandArgs[0]) && commandArgs.slice(1).every((item) => /^[A-Za-z0-9_./:=*-]+$/.test(item));
+      return commandArgs.length >= 1 && ["test", "build"].includes(commandArgs[0]) && commandArgs.slice(1).every((item) => safeRelativeArgument(item) && /^[A-Za-z0-9_./:=*-]+$/.test(item));
     default:
       return false;
   }
@@ -521,7 +580,7 @@ function validatePlanDraft(value: unknown): string[] {
 }
 
 function isPlanPath(path: string): boolean {
-  return path.replace(/\\/g, "/").replace(/^\.\//, "") === planPath;
+  return canonicalPath(path) === planPath;
 }
 
 function statusPathsExcludingPlan(status: GitStatus | null): string[] | null {
@@ -560,7 +619,31 @@ async function changedFilesExcludingPlan(): Promise<string[] | null> {
   }
 }
 
-function planToMarkdown(plan: PlanDraft, review: PlanReview, reconFailures: string[]): string {
+async function readHead(): Promise<string | null> {
+  try {
+    const result = await world.run("git", ["rev-parse", "HEAD"]);
+    return result.exitCode === 0 ? result.stdout.trim() || null : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readStashRef(): Promise<string | null> {
+  try {
+    const result = await world.run("git", ["stash", "list", "--format=%H"]);
+    return result.exitCode === 0 ? result.stdout.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function planToMarkdown(
+  plan: PlanDraft,
+  review: PlanReview,
+  reconFailures: string[],
+  constraints: string,
+  scope: string,
+): string {
   const contract: ExecutionContract = {
     contractVersion: 1,
     approved: false,
@@ -577,6 +660,21 @@ function planToMarkdown(plan: PlanDraft, review: PlanReview, reconFailures: stri
     "",
   );
   lines.push(plan.summary, "");
+  lines.push("## 规划约束与范围", "");
+  lines.push(`- 用户约束：${constraints || "（无）"}`);
+  lines.push(`- 用户 scope：${scope || "（由勘察员按需求划分）"}`, "");
+  lines.push("## 独立评审详情", "");
+  lines.push(`- verdict：${review.verdict}`);
+  lines.push(`- 摘要：${review.summary}`);
+  if (review.issues.length) {
+    review.issues.forEach((issue) =>
+      lines.push(`- [${issue.severity}] ${issue.taskId}：${issue.problem}（修复：${issue.fix}）`),
+    );
+  }
+  if (review.missing.length) review.missing.forEach((item) => lines.push(`- 缺失：${item}`));
+  if (review.scopeConcerns.length) review.scopeConcerns.forEach((item) => lines.push(`- 范围疑虑：${item}`));
+  if (review.acceptanceConcerns.length) review.acceptanceConcerns.forEach((item) => lines.push(`- 验收疑虑：${item}`));
+  lines.push("");
 
   lines.push("## 需求拆解", "");
   if (plan.requirements.length) {
@@ -659,7 +757,7 @@ function planToMarkdown(plan: PlanDraft, review: PlanReview, reconFailures: stri
   return lines.join("\n");
 }
 
-async function detectAcceptance(): Promise<string[]> {
+async function detectAcceptance(platform: string): Promise<string[]> {
   const found: string[] = [];
   let root: string[] = [];
   try {
@@ -694,7 +792,17 @@ async function detectAcceptance(): Promise<string[]> {
   if (has("go.mod")) found.push("go test ./...", "go build ./...");
   if (has("pom.xml")) found.push("mvn test");
   if (has("build.gradle") || has("build.gradle.kts")) {
-    found.push(has("gradlew.bat") ? "gradlew.bat test" : has("gradlew") ? "gradlew test" : "gradle test");
+    found.push(
+      platform === "win32"
+        ? has("gradlew.bat")
+          ? "gradlew.bat test"
+          : has("gradlew")
+            ? "gradlew test"
+            : "gradle test"
+        : has("gradlew")
+          ? "gradlew test"
+          : "gradle test",
+    );
   }
   if (has("pyproject.toml") || has("pytest.ini") || has("tox.ini")) found.push("pytest");
   if (has("Cargo.toml")) found.push("cargo test");
@@ -704,9 +812,36 @@ async function detectAcceptance(): Promise<string[]> {
 }
 
 phase("确认验收基线");
+try {
+  const matches = await files.glob(planPath);
+  planFileExists = matches.some((match) => canonicalPath(match) === planPath);
+} catch {
+  planFileExists = false;
+}
+if (planFileExists) {
+  try {
+    existingPlanContent = await files.read(planPath);
+  } catch {
+    throw new Error("task-plan: planPath exists but cannot be read safely; choose another path");
+  }
+  if (existingPlanContent.trim()) {
+    const looksLikePlan =
+      existingPlanContent.includes("TASK_RUN_CONTRACT_START") &&
+      existingPlanContent.includes("TASK_RUN_CONTRACT_END") &&
+      existingPlanContent.includes("# 实施方案：");
+    if (!looksLikePlan) {
+      throw new Error("task-plan: planPath already contains a non-plan file; choose a new .md path");
+    }
+    if (/"approved"\s*:\s*true/.test(existingPlanContent)) {
+      throw new Error("task-plan: refusing to overwrite an approved plan; choose a new path or revoke approval first");
+    }
+  }
+}
 const baselineFiles = await changedFilesExcludingPlan();
 const baselineGitStatus = await git.status().catch(() => null);
 const baselineSourceSnapshot = await sourceSnapshot(baselineGitStatus);
+const baselineHead = await readHead();
+const baselineStash = await readStashRef();
 
 const baselineSourcePaths = statusPathsExcludingPlan(baselineGitStatus);
 const baseline = baselineFiles === null ? "（不是 git 仓库）" : baselineFiles.length ? baselineFiles.join("\n") : "（干净）";
@@ -719,7 +854,7 @@ try {
 } catch {
   platform = "unknown";
 }
-const detected = acceptanceArg ? unique(splitCommands(acceptanceArg)) : await detectAcceptance();
+const detected = acceptanceArg ? unique(splitCommands(acceptanceArg)) : await detectAcceptance(platform);
 
 let inputPath = "";
 if (!requirement.includes("\n")) {
@@ -736,10 +871,17 @@ const requirementBlock = inputPath
 
 let shards: ReconShard[];
 const scopeLines = splitScope(scopeArg);
+if (scopeLines.length > 12) {
+  throw new Error("task-plan: args.scope must contain at most 12 entries");
+}
+const invalidScope = scopeLines.find((path) => !validReconPath(path));
+if (invalidScope) {
+  throw new Error(`task-plan: unsafe scope path: ${invalidScope}`);
+}
 if (scopeLines.length > 0) {
   shards = scopeLines.map((path, index) => ({
     name: `范围${index + 1}`,
-    paths: [path],
+    paths: [path === "." ? "." : canonicalPath(path) ?? path],
     focus: `勘察 ${path} 的现状、入口、约束和改动点`,
   }));
 } else {
@@ -752,9 +894,18 @@ if (scopeLines.length > 0) {
       `请用文件工具查看仓库结构，然后提出 3-6 个互不重叠的勘察分片。每个分片给出 name、paths（workspace 相对路径/目录）、focus。` +
       `分片要覆盖需求涉及的主要区域，不要全仓库平均分。只读，不要修改任何文件。输出语言：${language}。`,
   );
-  shards = proposed.shards.slice(0, 6).map((shard, index) => ({
+  const selectedShards = proposed.shards.slice(0, 6);
+  const invalidShardPath = selectedShards
+    .flatMap((shard) => shard.paths)
+    .find((path) => !validReconPath(path));
+  if (invalidShardPath) {
+    throw new Error(`task-plan: scout proposed an unsafe path: ${invalidShardPath}`);
+  }
+  shards = selectedShards.map((shard, index) => ({
     name: `${shard.name || "分片"}·${index + 1}`,
-    paths: shard.paths.length ? shard.paths : ["."],
+    paths: shard.paths.length
+      ? shard.paths.map((path) => (path === "." ? "." : canonicalPath(path) ?? path))
+      : ["."],
     focus: shard.focus || "勘察与需求相关的现状",
   }));
   if (shards.length === 0) {
@@ -790,6 +941,9 @@ reconSettled.forEach((outcome, index) => {
 if (reconFailures.length > 0) {
   log(`有 ${reconFailures.length} 个勘察分片失败，计划将基于其余分片`);
 }
+if (recon.length === 0) {
+  throw new Error("task-plan: 所有勘察分片失败，拒绝生成缺乏证据的可执行计划");
+}
 
 phase("拆分修复批次并写出计划草稿");
 const planner = agent("实施方案编排员", {
@@ -804,12 +958,13 @@ const planPrompt =
   `勘察结果：\n${reconText}\n\n` +
   `勘察失败的分片：\n${reconFailures.length ? reconFailures.join("\n") : "无"}\n\n` +
   (extraConstraints ? `用户约束：\n${extraConstraints}\n\n` : "") +
+  `用户 scope：${scopeArg || "（由勘察员按需求划分）"}\n\n` +
   `请输出完整 PlanDraft（严格按接口字段）。目标是给真实功能做方案设计，不是只列文件任务。规则：\n` +
   `1. 把原需求拆成原子 requirements，每条有稳定 id、可观察验收标准；任务必须通过 requirementIds 覆盖需求，未覆盖项明确指出。\n` +
   `2. architecture 写目标组件、数据流、集成/API/权限边界；securityPrivacy、dataMigration 对相关领域给出控制或明确说明不适用。\n` +
   `3. technicalDecisions 按关键领域列选择、仓库路径证据、为什么适合、可信替代方案、取舍和风险；不得无证据地引入新框架/依赖。证据不足时列阻塞问题，不伪造依据。\n` +
   `4. 每个 ready 任务必须有 requirementIds、files（workspace 相对路径/目录）、具体有序 steps、behaviorAcceptance、acceptanceCommand（program + args 数组）、risk 和 riskMitigation。行为验收写用户可观察结果，命令只作为自动化验证。\n` +
-  `5. acceptanceCommand 只从以下可执行程序中选：npm、pnpm、yarn、go、cargo、pytest、mvn、gradle、gradlew、make、dotnet。args 必须是参数数组，不要拼 shell 命令、管道、重定向或命令分隔符；包管理器仅允许执行仓库 scripts 中 test/build/lint/typecheck/check 类脚本。\n` +
+  `5. acceptanceCommand 只从以下可执行程序中选：npm、pnpm、yarn、go、cargo、pytest、mvn、gradle、gradlew、make、dotnet。args 必须是参数数组，不要拼 shell 命令、管道、重定向或命令分隔符；路径参数必须留在 workspace 内，不得使用绝对路径或 ..；包管理器仅允许执行仓库 scripts 中 test/build/lint/typecheck/check 类脚本。\n` +
   `6. 任务要小：一个逻辑改动，尽量不超过 5 个文件；共享文件的任务用 dependsOn 串行。新文件要在 files 中明确写出。\n` +
   `7. 需要业务决定/运行时人工验证或证据不足的部分标 needs-info，并将问题写成 openQuestions 对象（id/question/blocking/relatedTaskIds）；明确不修的写进 notDoing。\n` +
   `8. 工作树可能已有未提交改动；不要回滚或格式化无关改动。\n` +
@@ -834,6 +989,8 @@ const reviewPrompt = (plan: PlanDraft) =>
   `平台：${platform}\n` +
   `验收基线：\n${baseline || "（干净）"}\n` +
   `自动探测到的命令：\n${detected.length ? detected.join("\n") : "（无）"}\n\n` +
+  `用户约束：\n${extraConstraints || "（无）"}\n\n` +
+  `用户 scope：${scopeArg || "（由勘察员按需求划分）"}\n\n` +
   `计划：\n${JSON.stringify(plan)}\n\n` +
   `勘察：\n${reconText}\n\n` +
   `勘察失败的分片：\n${reconFailures.length ? reconFailures.join("\n") : "无"}\n\n` +
@@ -841,11 +998,12 @@ const reviewPrompt = (plan: PlanDraft) =>
   `1. 是否逐条拆分并覆盖 requirements，用户可观察的验收结果是否与需求一致；\n` +
   `2. architecture 是否适配仓库已有模式；technicalDecisions 是否有可核实的路径/代码证据、选择理由、真实替代方案和明确取舍；是否引入不必要依赖；\n` +
   `3. 是否处理安全/隐私、数据一致性/迁移、权限、错误处理、可访问性等相关领域；不适用项是否明确说明；\n` +
-  `4. 每个 ready 任务是否有真实范围、非空步骤、requirementIds、行为验收、结构化可执行 acceptanceCommand 和具体风险缓解；命令程序及参数是否安全且在仓库存在；\n` +
+  `4. 每个 ready 任务是否有真实范围、非空步骤、requirementIds、行为验收、结构化可执行 acceptanceCommand 和具体风险缓解；命令程序及参数是否安全、在仓库存在且未越过 workspace；\n` +
   `5. dependsOn 是否正确、无循环；任务范围是否有冲突、漏项或范围蔓延；needs-info / do-not-fix 是否分对；\n` +
   `6. 行为验收不能被构建/测试命令替代，需覆盖功能情境、边界/错误情形和权限规则（适用时）；\n` +
   `7. 勘察失败的分片是否被正确处理，有没有假装覆盖；\n` +
-  `8. 是否有阻塞性 openQuestions；有则相关任务必须不是 ready。\n` +
+  `8. 是否逐条遵守用户约束和 scope；任何违反都是 high issue；\n` +
+  `9. 是否有阻塞性 openQuestions；有则相关任务必须不是 ready。\n` +
   `只读，不要修改文件。输出 PlanReview。approve 仅在所有关键项均有证据且无 high issue 时给出；否则 revise 或 reject。输出语言：${language}。`;
 const reviewer = agent("计划评审员", { system: reviewSystem });
 let finalDraft = validatedDraft;
@@ -859,6 +1017,8 @@ if (finalReview.verdict !== "approve") {
       `原计划：\n${JSON.stringify(finalDraft)}\n\n` +
       `评审：\n${JSON.stringify(finalReview)}\n\n` +
       `初稿 schema 校验错误：${revisionErrors.length ? revisionErrors.join("；") : "无"}\n` +
+      `用户约束：\n${extraConstraints || "（无）"}\n` +
+      `用户 scope：${scopeArg || "（由勘察员按需求划分）"}\n` +
       `输出修订后的 PlanDraft，必须满足新版完整字段和详细方案规则：requirements 覆盖、仓库证据支持的 architecture/technicalDecisions、行为验收、structured acceptanceCommand、风险缓解、问题关联。不要发明文件。输出语言：${language}。`,
   );
   schemaErrors = validatePlanDraft(finalDraft);
@@ -870,49 +1030,105 @@ if (finalReview.verdict !== "approve") {
 }
 
 phase("写出 plan.md");
-const planMarkdown = planToMarkdown(finalDraft, finalReview, reconFailures);
+const markerSource = {
+  plan: finalDraft,
+  review: finalReview,
+  constraints: extraConstraints,
+  scope: scopeArg,
+  reconFailures,
+};
+if (containsReservedMarker(markerSource)) {
+  throw new Error("task-plan: 计划数据包含保留的 TASK_RUN_CONTRACT 标记，无法生成可执行合同");
+}
+const planMarkdown = planToMarkdown(finalDraft, finalReview, reconFailures, extraConstraints, scopeArg);
 const writer = agent("计划落盘员", {
   system: "你只负责把给定的 Markdown 原样写入指定文件。不要修改源码，不要改写内容。",
 });
-await writer.ask(
-  `把下面的 Markdown 原样写入 workspace 相对路径 ${planPath}（使用文件写入工具，必要时创建目录）。不要修改任何源码。写完后回复 "written"。\n\n---\n${planMarkdown}\n---`,
-);
-
 let written = "";
+let planWriteError = "";
+let restoredOldPlan = false;
 try {
-  written = await files.read(planPath);
-} catch {
-  written = "";
-}
-if (written !== planMarkdown) {
   await writer.ask(
-    `文件 ${planPath} 缺失或与目标内容不同。请把下面的 Markdown 原样重写进去，不要改源码。\n\n---BEGIN PLAN---\n${planMarkdown}\n---END PLAN---`,
+    `把下面的 Markdown 原样写入 workspace 相对路径 ${planPath}（使用文件写入工具，必要时创建目录）。不要修改任何源码。写完后回复 "written"。\n\n---\n${planMarkdown}\n---`,
   );
   try {
     written = await files.read(planPath);
   } catch {
     written = "";
   }
+  if (!samePlanText(written, planMarkdown)) {
+    await writer.ask(
+      `文件 ${planPath} 缺失或与目标内容不同。请把下面的 Markdown 原样重写进去，不要改源码。\n\n---BEGIN PLAN---\n${planMarkdown}\n---END PLAN---`,
+    );
+    try {
+      written = await files.read(planPath);
+    } catch {
+      written = "";
+    }
+  }
+} catch (error) {
+  planWriteError = `计划落盘员执行失败：${String(error)}`;
 }
-const planWritten = written === planMarkdown;
+const planWritten = samePlanText(written, planMarkdown);
+if (!planWritten && existingPlanContent) {
+  try {
+    await writer.ask(
+      `计划写入失败。请把下面的旧计划原样恢复写入 ${planPath}，不要留下部分新内容。写完后回复 "restored"。\n\n---BEGIN OLD PLAN---\n${existingPlanContent}\n---END OLD PLAN---`,
+    );
+    const restored = await files.read(planPath);
+    restoredOldPlan = samePlanText(restored, existingPlanContent);
+    if (!restoredOldPlan) {
+      planWriteError = `${planWriteError}${planWriteError ? "；" : ""}旧计划恢复后内容仍不一致`;
+    }
+  } catch (error) {
+    planWriteError = `${planWriteError}${planWriteError ? "；" : ""}旧计划恢复失败：${String(error)}`;
+  }
+}
+if (!planWritten && !planWriteError) {
+  planWriteError = "写入内容与生成内容不一致";
+}
+if (restoredOldPlan) {
+  planWriteError = `${planWriteError}（旧计划已恢复）`;
+}
 
 phase("确认计划阶段未改源码");
 const finalFiles = await changedFilesExcludingPlan();
 const finalGitStatus = await git.status().catch(() => null);
 const finalSourceSnapshot = await sourceSnapshot(finalGitStatus);
-const finalStatus = finalFiles === null
+const finalHead = await readHead();
+const finalStash = await readStashRef();
+const headComparable = baselineHead !== null && finalHead !== null;
+const stashComparable = baselineStash !== null && finalStash !== null;
+const headChanged = headComparable && baselineHead !== finalHead;
+const stashChanged = stashComparable && baselineStash !== finalStash;
+const finalStatusBase = finalFiles === null
   ? "（无法读取 git status）"
   : finalFiles.length
     ? finalFiles.join("\n")
     : "（无源码改动）";
+const integrityNotes = [
+  headChanged ? "Git HEAD 在计划阶段发生变化" : "",
+  stashChanged ? "Git stash 在计划阶段发生变化" : "",
+  !headComparable ? "无法读取 Git HEAD" : "",
+  !stashComparable ? "无法读取 Git stash" : "",
+].filter(Boolean);
+const finalStatus = integrityNotes.length
+  ? `${finalStatusBase}\n（${integrityNotes.join("；")}）`
+  : finalStatusBase;
 
 const sourceUnchanged =
   finalFiles !== null &&
   baselineIsClean &&
   baselineSourceSnapshot !== null &&
-  finalSourceSnapshot !== null
+  finalSourceSnapshot !== null &&
+  headComparable &&
+  stashComparable &&
+  baselineHead === finalHead &&
+  baselineStash === finalStash
     ? stableJson(baselineSourceSnapshot) === stableJson(finalSourceSnapshot)
-    : null;
+    : headChanged || stashChanged
+      ? false
+      : null;
 
 try {
   await artifact.markdown("plan", planMarkdown, {
@@ -926,7 +1142,7 @@ try {
 
 const conclusion = planWritten
   ? `计划已写入 ${planPath}：${finalDraft.tasks.length} 个任务，独立评审 ${finalReview.verdict}${reconFailures.length ? `，${reconFailures.length} 个勘察分片失败` : ""}。`
-  : `计划已生成，但写入 ${planPath} 失败；请从产物复制或让计划落盘员重写。`;
+  : `计划已生成，但写入 ${planPath} 失败${planWriteError ? `：${planWriteError}` : ""}；请从产物复制或让计划落盘员重写。`;
 
 const result: PlanReport = {
   conclusion,
@@ -938,6 +1154,9 @@ const result: PlanReport = {
   sourceUnchanged,
   detectedAcceptance: detected,
   reconFailures,
+  constraints: extraConstraints,
+  scope: scopeArg,
+  planWriteError,
   planWritten,
 };
 return result;

@@ -16,4 +16,4 @@ The matching project skills are under `.agents/skills/`. When this repository is
 3. Set only the contract's `approved` field to `true` after approval.
 4. Run the `task-run` skill against that plan.
 
-`task-run` does not execute arbitrary shell command strings. Project test and build scripts still run with the current user's permissions; this is not an operating-system sandbox. See each skill's `SKILL.md` for the full contract and safety boundaries.
+`task-plan` writes only a normalized `.md` plan path, refuses to overwrite non-plan or already approved files, and records review/constraints in the plan. `task-run` rechecks the plan file and Git HEAD/stash so a task cannot silently change the approved contract or hide work in a commit/stash. These checks cover the workspace only; they are not an operating-system sandbox. See each skill's `SKILL.md` for details and limitations.

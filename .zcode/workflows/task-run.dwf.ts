@@ -4,7 +4,7 @@ whenToUse: 当用户已审阅、解决阻塞问题并显式批准 plan.md 中的
 args:
   planPath:
     type: string
-    description: 经审阅并批准的 plan.md workspace 相对路径。
+    description: 经审阅并批准的 plan.md workspace 相对路径，必须是规范化 .md 文件。
     required: true
   stopOnFailure:
     type: boolean
@@ -133,26 +133,15 @@ interface CommandOutcome {
   stderr: string;
 }
 
-const planPath = String(args.planPath ?? "")
-  .trim()
-  .replace(/\\/g, "/")
-  .replace(/^\.\//, "");
+const planPathCandidate = canonicalPath(String(args.planPath ?? "").trim());
 const stopOnFailure = args.stopOnFailure !== false;
 const language = String(args.language ?? "中文").trim();
 const startMarker = "<!-- TASK_RUN_CONTRACT_START -->";
 const endMarker = "<!-- TASK_RUN_CONTRACT_END -->";
-if (
-  !planPath ||
-  planPath.startsWith("/") ||
-  planPath.startsWith("\\") ||
-  /^[A-Za-z]:\//.test(planPath) ||
-  planPath.split("/").some((part) => part === ".." || part.toLowerCase() === ".git") ||
-  planPath === "." ||
-  planPath.endsWith("/") ||
-  !validRepoPath(planPath)
-) {
-  throw new Error("task-run: args.planPath must be workspace-relative and cannot contain '..' or '.git'");
+if (!planPathCandidate || !planPathCandidate.toLowerCase().endsWith(".md")) {
+  throw new Error("task-run: args.planPath must be a workspace-relative .md file");
 }
+const planPath = planPathCandidate;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -188,23 +177,58 @@ function isControlText(value: string): boolean {
   });
 }
 
+function canonicalPath(value: string): string | null {
+  const normalized = value.replace(/\\/g, "/");
+  if (!normalized || normalized !== normalized.trim()) return null;
+  if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) return null;
+  let path = normalized;
+  while (path.startsWith("./")) path = path.slice(2);
+  if (!path || path === "." || path.endsWith("/")) return null;
+  if (path.startsWith("!") || path.startsWith(":")) return null;
+  const parts = path.split("/");
+  if (
+    parts.some(
+      (part) =>
+        !part ||
+        part === "." ||
+        part === ".." ||
+        part.toLowerCase() === ".git" ||
+        part.includes(":") ||
+        /[. ]$/.test(part),
+    )
+  ) {
+    return null;
+  }
+  if (
+    path.split("").some((character) => {
+      const code = character.charCodeAt(0);
+      return code === 0 || code === 10 || code === 13 || "*?[]{}".includes(character);
+    })
+  ) {
+    return null;
+  }
+  return path;
+}
+
 function validRepoPath(path: string): boolean {
-  const normalized = path.replace(/\\/g, "/");
-  return Boolean(
-    normalized &&
-      !normalized.startsWith("/") &&
-      !/^[A-Za-z]:/.test(normalized) &&
-      !normalized.split("/").some((part) => part === ".." || part.toLowerCase() === ".git") &&
-      !normalized.split("").some((character) => "*?[]{}".includes(character) || isControlText(character)),
+  return canonicalPath(path) !== null;
+}
+
+function safeRelativeArgument(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/");
+  return (
+    !normalized.startsWith("/") &&
+    !/^[A-Za-z]:/.test(normalized) &&
+    !normalized.split("/").some((part) => part === ".." || part.split("=").some((item) => item === ".."))
   );
 }
 
 function withinScope(file: string, scopes: string[]): boolean {
-  const candidate = file.replace(/\\/g, "/").replace(/^\.\//, "");
+  const candidate = canonicalPath(file);
+  if (candidate === null) return false;
   return scopes.some((entry) => {
-    const normalized = entry.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-    if (normalized === ".") return true;
-    return candidate === normalized || candidate.startsWith(`${normalized}/`);
+    const normalized = canonicalPath(entry);
+    return normalized !== null && (candidate === normalized || candidate.startsWith(`${normalized}/`));
   });
 }
 
@@ -231,7 +255,7 @@ function validAcceptanceCommand(value: unknown): value is AcceptanceCommand {
         ["test", "build"].includes(commandArgs[0]) &&
         commandArgs.slice(1).every(
           (item) => ["-race", "-cover", "-v", "-count=1", "./..."].includes(item) ||
-            (/^[A-Za-z0-9_./*]+$/.test(item) && !item.split("/").includes("..") && !item.startsWith("-")),
+            (safeRelativeArgument(item) && /^[A-Za-z0-9_./*]+$/.test(item) && !item.split("/").includes("..") && !item.startsWith("-")),
         )
       );
     case "cargo":
@@ -242,7 +266,7 @@ function validAcceptanceCommand(value: unknown): value is AcceptanceCommand {
       );
     case "pytest":
       return commandArgs.every(
-        (item) => ["-q", "-v", "--quiet", "--strict-markers"].includes(item) || /^[A-Za-z0-9_./:-]+$/.test(item),
+        (item) => ["-q", "-v", "--quiet", "--strict-markers"].includes(item) || (safeRelativeArgument(item) && /^[A-Za-z0-9_./:-]+$/.test(item)),
       );
     case "mvn":
       return commandArgs.length === 1 && ["test", "verify", "package"].includes(commandArgs[0]);
@@ -253,7 +277,7 @@ function validAcceptanceCommand(value: unknown): value is AcceptanceCommand {
     case "make":
       return commandArgs.length === 1 && ["test", "check", "build", "lint"].includes(commandArgs[0]);
     case "dotnet":
-      return commandArgs.length >= 1 && ["test", "build"].includes(commandArgs[0]) && commandArgs.slice(1).every((item) => /^[A-Za-z0-9_./:=*-]+$/.test(item));
+      return commandArgs.length >= 1 && ["test", "build"].includes(commandArgs[0]) && commandArgs.slice(1).every((item) => safeRelativeArgument(item) && /^[A-Za-z0-9_./:=*-]+$/.test(item));
     default:
       return false;
   }
@@ -503,6 +527,7 @@ function parseContract(content: string): { contract: ExecutionContract | null; e
 }
 
 async function captureSnapshot(scopes: string[]): Promise<FileSnapshot | null> {
+  if (scopes.length === 0) return { paths: [], content: {} };
   try {
     const changedPaths = await git.changedFiles();
     const ignored = await world.run("git", ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...scopes]);
@@ -526,14 +551,33 @@ async function captureSnapshot(scopes: string[]): Promise<FileSnapshot | null> {
   }
 }
 
+async function readHead(): Promise<string | null> {
+  try {
+    const result = await world.run("git", ["rev-parse", "HEAD"]);
+    return result.exitCode === 0 ? result.stdout.trim() || null : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readStashRef(): Promise<string | null> {
+  try {
+    const result = await world.run("git", ["stash", "list", "--format=%H"]);
+    return result.exitCode === 0 ? result.stdout.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 function changedBetween(before: FileSnapshot, after: FileSnapshot): string[] {
   const paths = new Set([...before.paths, ...after.paths]);
   return [...paths].filter((path) => before.content[path] !== after.content[path]).sort();
 }
 
 function cleanExceptPlan(status: GitStatus, path: string): string[] {
+  const target = canonicalPath(path);
   const changed = new Set([...status.staged, ...status.unstaged, ...status.untracked]);
-  return [...changed].filter((item) => item !== path).sort();
+  return [...changed].filter((item) => canonicalPath(item) !== target).sort();
 }
 
 function commandLabel(command: AcceptanceCommand | null): string {
@@ -599,7 +643,16 @@ function reportMarkdown(report: RunReport, planTitle: string): string {
     "",
     report.conclusion,
     "",
-    "> 验收程序通过非 shell argv 调用；Git 变更全仓库检查，ignored 文件检查覆盖合同内所有任务范围；项目自身的测试脚本/build 脚本仍以当前用户权限执行，这不是操作系统沙箱。行为验收标准仍需结合结果人工确认。",
+    "> 验收程序通过非 shell argv 调用；Git 变更只检查当前 workspace 工作树（不含提交历史/workspace 外），ignored 文件检查覆盖合同内所有任务范围；项目自身的测试脚本/build 脚本仍以当前用户权限执行，这不是操作系统沙箱。行为验收标准仍需结合结果人工确认。",
+    "",
+    "## 基线与最终状态",
+    "",
+    `- 基线：${report.baseline}`,
+    "- 最终状态：",
+    "~~~text",
+    report.finalStatus,
+    "~~~",
+    `- 汇总改动：${report.filesChanged.join("、") || "无"}`,
     "",
     "## 批次结果",
     "",
@@ -647,14 +700,22 @@ try {
   planContent = "";
 }
 const parsed = planContent.trim() ? parseContract(planContent) : { contract: null, errors: [`${planPath} 不存在、不可读或为空`] };
-const gitProbe = await world.run("git", ["rev-parse", "--show-toplevel"]);
+const gitProbe = await world.run("git", ["rev-parse", "--show-toplevel"]).catch(() => null);
 const gitStatus = await git.status().catch(() => null);
+const initialHead = await readHead();
+const initialStash = await readStashRef();
 const validationErrors = parsed.errors.slice();
-if (gitProbe.exitCode !== 0 || !gitStatus) validationErrors.push("Git 不可用：为避免误报范围检查成功，拒绝执行");
+if (!gitProbe || gitProbe.exitCode !== 0 || !gitStatus) validationErrors.push("Git 不可用：为避免误报范围检查成功，拒绝执行");
+if (!initialHead) validationErrors.push("无法读取 Git HEAD：为避免把提交/重置误认为没有改动，拒绝执行");
+if (initialStash === null) validationErrors.push("无法读取 Git stash 状态：为避免隐藏改动，拒绝执行");
 if (gitStatus?.staged.length) validationErrors.push(`暂存区必须为空，避免将已有暂存改动与任务改动混淆：${gitStatus.staged.join("、")}`);
 const unexpectedBaseline = gitStatus ? cleanExceptPlan(gitStatus, planPath) : [];
 if (unexpectedBaseline.length) validationErrors.push(`执行前工作树必须干净（plan.md 除外）；发现其他改动：${unexpectedBaseline.join("、")}`);
-const snapshotScopes = parsed.contract ? [...new Set(parsed.contract.plan.tasks.flatMap((task) => task.files))] : [];
+const snapshotScopes = parsed.contract
+  ? [...new Set(parsed.contract.plan.tasks.flatMap((task) =>
+      task.files.map((file) => canonicalPath(file)).filter((file): file is string => file !== null),
+    ))]
+  : [];
 const baselineSnapshot = parsed.contract && gitStatus ? await captureSnapshot(snapshotScopes) : null;
 if (parsed.contract && gitStatus && !baselineSnapshot) validationErrors.push("无法读取 Git 变更文件内容快照，拒绝执行");
 
@@ -668,6 +729,8 @@ if (validationErrors.length || !parsed.contract || !baselineSnapshot) {
 const contract = parsed.contract;
 const plan = contract.plan;
 const planTitle = plan.title;
+const headBaseline = initialHead ?? "";
+const stashBaseline = initialStash ?? "";
 const readyTasks = plan.tasks.filter((task) => task.status === "ready");
 const pendingTasks = plan.tasks.filter((task) => task.status !== "ready");
 const orderedTasks: RunTask[] = [];
@@ -679,22 +742,31 @@ while (orderedTasks.length < readyTasks.length) {
   completedIds.add(next.id);
 }
 
-artifact.board("batches", {
-  title: "修复批次进度",
-  key: "taskId",
-  status: "status",
-  columns: ["pending", "running", "completed", "failed", "skipped"],
-  cardTitle: "title",
-  detail: [
-    { field: "acceptanceCommand", label: "自动化验收" },
-    { field: "exitCode", label: "退出码" },
-  ],
-});
+let batchBoardReady = false;
+try {
+  artifact.board("batches", {
+    title: "修复批次进度",
+    key: "taskId",
+    status: "status",
+    columns: ["pending", "running", "completed", "failed", "skipped"],
+    cardTitle: "title",
+    detail: [
+      { field: "acceptanceCommand", label: "自动化验收" },
+      { field: "exitCode", label: "退出码" },
+    ],
+  });
+  batchBoardReady = true;
+} catch {
+  // The final report artifact still carries the batch results.
+}
+const publishBatch = (item: unknown): void => {
+  if (batchBoardReady) report(item, "batches");
+};
 
 phase("按批准方案分批施工并验收");
 for (const task of plan.tasks) {
   if (task.status !== "ready") continue;
-  report({ taskId: task.id, title: task.title, status: "pending", acceptanceCommand: commandLabel(task.acceptanceCommand), exitCode: 0 }, "batches");
+  publishBatch({ taskId: task.id, title: task.title, status: "pending", acceptanceCommand: commandLabel(task.acceptanceCommand), exitCode: 0 });
 }
 
 const results: BatchResult[] = [];
@@ -724,12 +796,12 @@ for (const task of orderedTasks) {
     };
     results.push(skipped);
     outcomeById.set(task.id, "skipped");
-    report({ ...skipped }, "batches");
+    publishBatch({ ...skipped });
     notCovered.push(`${task.id}: 依赖未成功，已跳过`);
     continue;
   }
 
-  report({ taskId: task.id, title: task.title, status: "running", acceptanceCommand: commandLabel(task.acceptanceCommand), exitCode: 0 }, "batches");
+  publishBatch({ taskId: task.id, title: task.title, status: "running", acceptanceCommand: commandLabel(task.acceptanceCommand), exitCode: 0 });
   const beforeSnapshot = await captureSnapshot(snapshotScopes);
   if (!beforeSnapshot) {
     const failed: BatchResult = {
@@ -747,7 +819,7 @@ for (const task of orderedTasks) {
     };
     results.push(failed);
     outcomeById.set(task.id, "failed");
-    report({ ...failed }, "batches");
+    publishBatch({ ...failed });
     deviations.push(`${task.id}: ${failed.notes}`);
     if (stopOnFailure) break;
     continue;
@@ -759,18 +831,32 @@ for (const task of orderedTasks) {
   const relatedDecisions = plan.technicalDecisions.filter((decision) =>
     task.steps.some((step) => step.toLowerCase().includes(decision.area.toLowerCase())) || task.rationale.toLowerCase().includes(decision.area.toLowerCase()),
   );
+  const taskRequirements = plan.requirements.filter((requirement) => task.requirementIds.includes(requirement.id));
+  const requirementContext = taskRequirements.length
+    ? taskRequirements.map((requirement) => `${requirement.id}: ${requirement.statement}（验收：${requirement.acceptanceCriteria.join("；")}）`).join("\n")
+    : "无";
+  const resolutionContext = contract.resolutions.length
+    ? contract.resolutions.map((resolution) => `${resolution.questionId}: ${resolution.decision}`).join("\n")
+    : "无";
   const fixPrompt =
     `计划文件：${planPath}\n任务：${task.id} ${task.title}\n` +
     `关联需求：${task.requirementIds.join("、")}\n` +
-    `需求和行为验收：\n${task.behaviorAcceptance.map((item) => `- ${item}`).join("\n")}\n` +
+    `需求原文与验收：\n${requirementContext}\n` +
+    `行为验收：\n${task.behaviorAcceptance.map((item) => `- ${item}`).join("\n")}\n` +
     `允许修改的文件/目录：${task.files.join("、")}\n` +
     `做法：\n${task.steps.map((step, index) => `${index + 1}. ${step}`).join("\n")}\n` +
     `技术决策：\n${relatedDecisions.length ? JSON.stringify(relatedDecisions) : "按计划架构和仓库现有约定实现，不引入未批准的方案"}\n` +
+    `架构边界：${plan.architecture.boundaries.join("；")}\n` +
+    `安全隐私：${plan.architecture.securityPrivacy.join("；")}\n` +
+    `数据迁移：${plan.architecture.dataMigration.join("；")}\n` +
+    `已批准决策：\n${resolutionContext}\n` +
+    `不修清单：${plan.notDoing.join("；") || "无"}\n` +
     `风险：${task.risk}\n风险缓解：${task.riskMitigation.join("；")}\n依据：${task.rationale}\n\n` +
     `硬规则：\n` +
-    `- 严格按步骤和批准的技术决策施工；不得自行缩小验收、改计划、发明需求或引入未批准依赖。\n` +
+    `- 先读取计划文件 ${planPath}，确认当前任务与批准方案一致；不得修改计划文件。\n` +
+    `- 严格按步骤、用户约束和批准的技术决策施工；不得自行缩小验收、改计划、发明需求或引入未批准依赖。\n` +
     `- 只修改列出的文件/目录；需要改其他文件时，停下来报告 blocked，不要擅自修改。\n` +
-    `- 不要运行验收命令；不要提交 git；不要启动服务。\n` +
+    `- 不要运行验收命令；不要提交 git；不要重置/切换 HEAD；不要启动服务。\n` +
     `- 完成后输出 FixOutcome：summary、filesChanged、notes、blocked、blockReason。\n` +
     `- 输出语言：${language}。`;
 
@@ -798,13 +884,59 @@ for (const task of orderedTasks) {
     };
     results.push(failed);
     outcomeById.set(task.id, "failed");
-    report({ ...failed }, "batches");
+    publishBatch({ ...failed });
     deviations.push(`${task.id}: ${failed.notes}`);
     if (stopOnFailure) break;
     continue;
   }
 
   const updatedPaths = changedBetween(beforeSnapshot, afterFixSnapshot);
+  const headAfterFix = await readHead();
+  if (headAfterFix !== headBaseline) {
+    const notes = `Git HEAD 在修复阶段发生变化（${headBaseline} -> ${headAfterFix ?? "不可读"}）；禁止提交、重置或切换 HEAD；验收命令未运行；不会自动回滚`;
+    const failed: BatchResult = {
+      taskId: task.id,
+      title: task.title,
+      status: "failed",
+      filesChanged: updatedPaths,
+      behaviorAcceptance: task.behaviorAcceptance,
+      acceptanceCommand: commandLabel(task.acceptanceCommand),
+      exitCode: 1,
+      stdout: "",
+      stderr: notes,
+      scopeVerified: false,
+      notes,
+    };
+    results.push(failed);
+    outcomeById.set(task.id, "failed");
+    publishBatch({ ...failed });
+    deviations.push(`${task.id}: ${failed.notes}`);
+    if (stopOnFailure) break;
+    continue;
+  }
+  const stashAfterFix = await readStashRef();
+  if (stashAfterFix !== stashBaseline) {
+    const notes = "Git stash 在修复阶段发生变化；禁止用 stash 隐藏改动；验收命令未运行；不会自动回滚";
+    const failed: BatchResult = {
+      taskId: task.id,
+      title: task.title,
+      status: "failed",
+      filesChanged: updatedPaths,
+      behaviorAcceptance: task.behaviorAcceptance,
+      acceptanceCommand: commandLabel(task.acceptanceCommand),
+      exitCode: 1,
+      stdout: "",
+      stderr: notes,
+      scopeVerified: false,
+      notes,
+    };
+    results.push(failed);
+    outcomeById.set(task.id, "failed");
+    publishBatch({ ...failed });
+    deviations.push(`${task.id}: ${failed.notes}`);
+    if (stopOnFailure) break;
+    continue;
+  }
   const outsideFix = updatedPaths.filter((path) => !withinScope(path, task.files));
   if (fix.blocked || outsideFix.length) {
     const notes = [fix.summary, fix.notes, fix.blocked ? `阻塞：${fix.blockReason}` : "", outsideFix.length ? `修复员范围外改动：${outsideFix.join("、")}` : ""]
@@ -825,7 +957,7 @@ for (const task of orderedTasks) {
     };
     results.push(failed);
     outcomeById.set(task.id, "failed");
-    report({ ...failed }, "batches");
+    publishBatch({ ...failed });
     deviations.push(`${task.id}: ${failed.notes}`);
     if (stopOnFailure) break;
     continue;
@@ -833,14 +965,24 @@ for (const task of orderedTasks) {
 
   const acceptance = await runAcceptance(task.acceptanceCommand);
   const afterAcceptanceSnapshot = await captureSnapshot(snapshotScopes);
+  const headAfterAcceptance = await readHead();
+  const stashAfterAcceptance = await readStashRef();
+  const headChangedDuringAcceptance = headAfterAcceptance !== headBaseline;
+  const stashChangedDuringAcceptance = stashAfterAcceptance !== stashBaseline;
   const acceptanceChanges = afterAcceptanceSnapshot ? changedBetween(afterFixSnapshot, afterAcceptanceSnapshot) : [];
   const outsideAcceptance = acceptanceChanges.filter((path) => !withinScope(path, task.files));
-  const scopeVerified = afterAcceptanceSnapshot !== null && outsideAcceptance.length === 0;
+  const scopeVerified =
+    afterAcceptanceSnapshot !== null &&
+    outsideAcceptance.length === 0 &&
+    !headChangedDuringAcceptance &&
+    !stashChangedDuringAcceptance;
   const succeeded = acceptance.exitCode === 0 && scopeVerified;
   const notes = [
     fix.summary,
     fix.notes,
     !afterAcceptanceSnapshot ? "验收后 Git 快照读取失败" : "",
+    headChangedDuringAcceptance ? `Git HEAD 在验收阶段发生变化（${headBaseline} -> ${headAfterAcceptance ?? "不可读"}）` : "",
+    stashChangedDuringAcceptance ? "Git stash 在验收阶段发生变化" : "",
     outsideAcceptance.length ? `验收命令造成范围外改动：${outsideAcceptance.join("、")}` : "",
   ]
     .filter(Boolean)
@@ -861,7 +1003,7 @@ for (const task of orderedTasks) {
   };
   results.push(result);
   outcomeById.set(task.id, result.status);
-  report({ ...result }, "batches");
+  publishBatch({ ...result });
 
   if (!succeeded) {
     deviations.push(`${task.id}: ${notes || `验收命令退出码 ${acceptance.exitCode}`}`);
@@ -887,7 +1029,7 @@ for (const task of orderedTasks) {
   };
   results.push(skipped);
   outcomeById.set(task.id, "skipped");
-  report({ ...skipped }, "batches");
+  publishBatch({ ...skipped });
   notCovered.push(`${task.id}: 前序任务失败后未执行`);
 }
 
@@ -897,16 +1039,52 @@ const completed = results.filter((result) => result.status === "completed").leng
 const failed = results.filter((result) => result.status === "failed").length;
 const skipped = results.filter((result) => result.status === "skipped").length;
 const allChanged = finalSnapshot && baselineSnapshot ? changedBetween(baselineSnapshot, finalSnapshot) : [];
-const finalStatus = !finalSnapshot
+
+let finalPlanContent = "";
+let planFileReadable = true;
+try {
+  finalPlanContent = await files.read(planPath);
+} catch {
+  planFileReadable = false;
+}
+const planFileUnchanged = planFileReadable && finalPlanContent === planContent;
+const finalHead = await readHead();
+const finalStash = await readStashRef();
+const headChangedAtEnd = finalHead !== headBaseline;
+const stashChangedAtEnd = finalStash !== stashBaseline;
+const finalStatusBase = !finalSnapshot
   ? "（无法读取 Git/ignored 文件快照）"
   : allChanged.length
     ? allChanged.join("\n")
     : "（无改动）";
+const integrityNotes = [
+  planFileUnchanged ? "" : "计划文件在执行期间被修改或删除",
+  headChangedAtEnd ? `Git HEAD 在运行期间发生变化（${headBaseline} -> ${finalHead ?? "不可读"}）` : "",
+  stashChangedAtEnd ? "Git stash 在运行期间发生变化" : "",
+].filter(Boolean);
+const finalStatus = integrityNotes.length
+  ? `${finalStatusBase}\n（${integrityNotes.join("；")}）`
+  : finalStatusBase;
 if (!finalSnapshot) notCovered.push("最终 Git/ignored 文件快照读取失败，无法完整汇总改动");
-const conclusion =
+if (!planFileUnchanged) {
+  deviations.push("计划文件在执行期间被修改或删除；本次执行仍使用启动时读取的合同，但计划文件完整性未通过");
+  notCovered.push("计划文件完整性校验失败");
+}
+if (headChangedAtEnd) {
+  deviations.push(`Git HEAD 在运行期间发生变化：${headBaseline} -> ${finalHead ?? "不可读"}`);
+  notCovered.push("Git HEAD 稳定性校验失败");
+}
+if (stashChangedAtEnd) {
+  deviations.push("Git stash 在运行期间发生变化");
+  notCovered.push("Git stash 稳定性校验失败");
+}
+const baseConclusion =
   completed + failed + skipped === 0
     ? "没有可执行的 ready 任务；未调用修复员。"
     : `处理 ${completed + failed + skipped} 个任务：${completed} 个自动验收及范围检查通过，${failed} 个失败，${skipped} 个未执行；行为验收标准需结合实际结果确认。`;
+const conclusion = integrityNotes.length
+  ? `${baseConclusion} 计划文件、Git HEAD 或 stash 完整性校验失败，结果不可视为完全成功。`
+  : baseConclusion;
 
 const result: RunReport = {
   conclusion,
