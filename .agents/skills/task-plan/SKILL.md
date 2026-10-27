@@ -1,43 +1,73 @@
 ---
 name: task-plan
-description: Use when turning a product requirement, report, or findings file into a repository-grounded implementation proposal before code changes. It decomposes requirements, proposes architecture and technology decisions with evidence/tradeoffs/risks, defines behavior and automated acceptance, then writes an unapproved versioned plan contract for human review.
+description: Use when turning a product requirement, report, or findings file into a repository-grounded v2 implementation plan before code changes. Defaults to lightweight standard mode with non-shell argv acceptance; strict mode is opt-in. Supports natural-language revisions with diff-only re-review, reviewedPlanSnapshot/reviewedReviewHash, recon gates for new files/modules/dependencies, and user-evidenced resolutions. Not for executing plans.
 ---
 
 # 任务计划（task-plan）
 
-把需求或报告变成可审阅、可执行的 `plan.md`。计划阶段只读源码，只写计划文件。它不仅拆文件任务，还应解释如何实现需求、采用哪些技术、为什么适合当前仓库、替代方案和风险。
+把需求或报告变成可审阅、可执行的 `plan.md`。计划阶段只读源码，只写计划文件；不执行计划。
+
+计划有两种模式：
+
+- **standard（默认）**：轻量计划。架构/技术决策可按复杂度省略；验收默认使用非 shell 的 `{ program, args }`。
+- **strict（`strict=true`）**：完整方案。必须有 requirements、architecture、technicalDecisions、风险缓解、依据和结构化验收；执行前必须显式批准。
+
+shell 验收只有显式 `allowShell=true` 才允许，且只在 standard 下可用；它始终标记为高风险，不是默认行为。
 
 ## 何时使用
 
-- 拿到一个产品/工程需求，想先审阅拆解、架构和实施步骤再执行；
+- 拿到产品/工程需求，想先看需求拆解、方案和验收再执行；
 - 已有 findings / 审查报告，想整理成有范围和验收的修复计划；
-- 需求跨越多个模块，需要先厘清业务规则、数据/接口边界、权限、安全和迁移风险。
+- 需求跨模块，需要先厘清业务规则、接口边界、权限、安全和迁移风险；
+- 已有 v2 `plan.md`，想用自然语言做定向修订。
 
-不要用于：一行修复、纯问答、已经有明确计划和验收的简单任务。
+不要用于：一行修复、纯问答、已有明确计划和验收的简单任务，或执行阶段。
 
 ## 输入
 
-- `requirement`（必填）：需求原文，或 findings / 报告文件的 workspace 相对路径。
-- `scope`（可选）：只读勘察范围，换行或逗号分隔，最多 12 项；必须是 workspace 相对路径，不能是绝对路径、`..` 或 `.git`；空则让勘察员按需求拆分仓库区域。
-- `planPath`（可选）：计划输出路径，默认 `plan.md`，必须是 workspace 相对、规范化且以 `.md` 结尾。不能覆盖非计划文件或已有已批准计划；已有未批准计划可以重写，写入失败会尝试恢复旧内容。
-- `acceptance`（可选）：以换行分隔的自动化验收命令提示；写入计划的命令必须属于 task-run 支持的结构化 argv 白名单。
+- `requirement`（创建模式必填；修订模式可选）：需求原文，或 findings/报告文件的 workspace 相对路径。
+- `scope`（可选）：只读勘察范围，换行或逗号分隔，最多 12 项；必须是 workspace 相对路径，不能是绝对路径、`..` 或 `.git`；空则让勘察员按需求拆分。
+- `planPath`（可选）：计划输出路径，默认 `plan.md`；必须是规范化 workspace 相对 `.md`。创建模式拒绝覆盖非计划文件或已批准计划；修订模式允许已批准计划，但会重置批准状态。
+- `acceptance`（可选）：验收命令提示，换行分隔；只是候选，不是执行源。
 - `constraints`（可选）：业务规则、共享文件、禁止改动、必须保留的 API 等。
 - `language`（可选）：默认中文。
+- `strict`（可选，默认 false）：创建 strict 计划；只在创建模式生效。
+- `allowShell`（可选，默认 false）：创建时允许 shell 验收（高风险）；只在创建模式生效。strict 下必须 false。
+- `changes`（可选）：对现有 v2 计划的自然语言修改；提供时进入修订模式，不重跑勘察。
 
 ## 计划内容
 
-计划必须包含：
+### standard 最低要求
 
-- 原子化需求条目及其可观察验收标准，并标出由哪些任务覆盖；
-- 用户约束、勘察范围及当前架构证据、目标组件/数据流/接口边界，以及安全隐私、数据迁移等适用性说明；
-- 每项关键技术/设计选择的仓库证据、选择理由、替代方案、取舍和风险；
-- 每个任务的需求关联、文件范围、有序实现步骤、行为验收、自动化验收命令、依赖、风险与缓解措施；
-- 独立评审的 verdict、摘要、问题、缺失项、范围和验收疑虑；
-- 假设、未覆盖项和带阻塞标记的待确认问题。
+- `goal`、`summary`、`tasks`；
+- 每个 ready 任务：`files`、`steps`、`behaviorAcceptance`、`risk`；
+- 验收唯一权威字段：`acceptanceKind="argv"` + 合法 `acceptanceCommand`；
+- `requirements` 可为空；`architecture` 可为 null；`technicalDecisions` 可为空；
+- `riskMitigation`、`rationale` 可为空。
 
-需求与任务按严格 schema 校验。验收命令必须使用 task-run 支持的结构化程序和参数；路径型参数必须留在 workspace 内，不能使用绝对路径或 `..`。用户提供的命令提示不会直接作为 shell 命令运行。行为验收说明功能表现，测试/构建命令不能代替行为标准。
+### strict 额外要求
 
-证据不足或业务决定未定时，不要替用户猜；相关任务标 `needs-info`。阻塞问题未解决时，相关任务不能是 `ready`。所有勘察分片失败时 workflow 会中止；部分失败会写入计划并在评审中显示，不能假装已覆盖。
+- `requirements` 非空，所有 ready 任务有 `requirementIds`，且每条需求被任务覆盖；
+- `architecture` 非空，包含 overview/boundaries/securityPrivacy/dataMigration；
+- `technicalDecisions` 非空，含仓库证据、理由、替代方案、取舍、风险；
+- ready 任务有 `riskMitigation`、`rationale`、结构化 `acceptanceCommand`；
+- 不允许 shell。
+
+### 验收唯一权威
+
+| 场景 | acceptanceKind | acceptance | acceptanceCommand |
+|---|---|---|---|
+| standard 默认 | `argv` | `null` | 合法 |
+| standard + allowShell | `argv` | `null` | 合法 |
+| standard + allowShell | `shell` | 非空、无控制字符、过危险黑名单 | `null` |
+| strict | `argv` | `null` | 合法 |
+| 非 ready | `none` | `null` | `null` |
+
+argv/shell 必须恰好一个字段非空；两个都填或都空都是 schema 错误。`detectedAcceptance` 和 `acceptance` 参数只是候选。
+
+### architecture=null
+
+standard 允许 `architecture=null`，但 planner 必须在 assumptions 说明为什么不需要；跨模块、新依赖、权限/安全/数据迁移必须提供完整 architecture。strict 缺 architecture 直接拒绝。
 
 ## 运行
 
@@ -45,38 +75,76 @@ description: Use when turning a product requirement, report, or findings file in
 CreateWorkflow({
   saved: {
     name: "task-plan",
-    args: { requirement, scope, planPath, acceptance, constraints, language },
+    args: {
+      requirement, scope, planPath, acceptance, constraints, language,
+      strict, allowShell, changes,
+    },
   },
 })
 ```
 
 不要用 `script` 重写一份，也不要用 `Agent` 手动模拟。确认窗口出现后让用户确认。
 
+## 创建流程
+
+1. 记录 Git 基线、内容快照、HEAD/stash、平台和候选验收命令；`sourceUnchanged` 只报告，不阻塞计划。
+2. 最多 6 个勘察分片；全部失败中止；部分失败写入计划并在评审中显示。
+3. planner 按 mode 生成 PlanDraft；standard 轻量、strict 完整。
+4. 模式感知 schema 校验；失败给一次修复机会，仍失败中止。
+5. 独立评审 + 一次自动修订 + 新评审员终审；`approve` 但存在 high/missing/scope/acceptance 时降级为 revise。
+6. 评审对象做运行时结构/语义校验；不合法让评审员重答一次。
+7. 写入 v2 合同：`approvalRequired = mode==="strict" && review.verdict==="approve"`，`approved=false`，并写入 `reviewedPlanSnapshot`、`reviewedReviewHash`、`resolutions`。
+8. 逐字写盘校验；失败重试一次；仍失败恢复旧计划。
+
+## 修订流程（`changes` 非空）
+
+- 读取现有 `plan.md`，必须 v2；v1 报错“请重新生成”。
+- `mode`/`allowShell` 从现有合同推断；修订不能改变模式或 shell 权限。
+- `requirement` 可选，作为额外上下文；不强制替换原 goal。
+- 允许修订已批准计划，但修订后 `approved=false`；写盘失败恢复旧计划（含旧批准状态）。
+- 计划修订员只做用户要求的修改，保持未受影响任务 id/字段不变。
+- 确定性 diff 列出新增/删除/修改任务及字段；发布 `plan-diff` artifact。
+- 只重审受影响任务和全局变化；有问题自动修一轮 + 新评审员终审。
+- **新增文件/模块/依赖闸门**：
+  - 仅新增文件且未重新勘察：相关 ready 任务标 `needs-info`，写 blocking openQuestion，不得直接 ready；
+  - 新增模块或依赖：`reconRequired=true`，不写 ready 计划，要求重新运行创建模式做勘察。
+- **resolutions 只能来自用户 changes**：
+  - 每项必须有逐字 `evidence`，且是 changes/需求文本的子串；
+  - 修订员不得自行编造决定；
+  - needs-info 提升为 ready 必须存在对应用户 resolution；否则 schema/闸门拒绝。
+- 更新 `review`、`reviewedPlanSnapshot`、`reviewedReviewHash`、`resolutions`；strict 下重新批准。
+
 ## 审阅与批准
 
-生成的 Markdown 包含 `TASK_RUN_CONTRACT_START` / `TASK_RUN_CONTRACT_END` 标记和版本化 JSON 合同。合同的 `approved` 初始为 `false`，计划只是草案；独立评审 verdict 不是 `approve` 时，`task-run` 必定拒绝。
+生成的 Markdown 包含 `TASK_RUN_CONTRACT_START` / `TASK_RUN_CONTRACT_END` 标记和 v2 JSON 合同。
 
-用户审阅后：
-
-1. 检查需求拆解、技术理由/证据、行为验收、任务范围和风险；
-2. 为每个阻塞问题在合同 `resolutions` 中写入 `{ "questionId": "Q1", "decision": "..." }`；
-3. 仅将合同根字段 `approved` 改为 `true`；
-4. 不要直接修改合同的 `plan`。`reviewedPlanSnapshot` 用于确定性发现只修改 `plan` 而未重新评审的漂移；它与 `plan` 同在合同内，不能作为防篡改签名。任何方案数据变化都应重新运行 `task-plan` 并重新审阅，不要把同步修改快照当作批准依据。
-
-不要只因为计划文件存在就称其已批准，也不要替用户设置批准标记。
+- `reviewedPlanSnapshot` 是 `stableJson(plan)`；计划内容变化必须重新运行 task-plan。
+- `reviewedReviewHash` 是 `sha256(stableJson(review))`；review 被修改会被 task-run 硬拒绝。
+- standard：无需单独批准，运行确认窗口即批准；review 有 high/missing/scope/acceptance 时 task-run 会返回 confirmationToken。
+- strict：
+  - 终审 `approve` 时 `requiresApproval=true`，用户审阅后把合同 `approved` 改为 `true`；
+  - 终审非 `approve` 时 `requiresApproval=false`，计划不可执行，需用 `changes` 修订或重新生成。
+- 未解决的 blocking 问题不能关联 ready 任务；回答阻塞问题不能靠 confirmationToken 绕过。
+- 不要直接改合同的 `plan`；方案变化走 `changes`。`resolutions` 的 evidence 用于审计，不是防篡改签名。
 
 ## 交付
 
-workflow 返回 `PlanReport`。说明计划路径、任务与评审结论、待确认问题、勘察缺口、用户约束/scope、候选验收命令文本和 `sourceUnchanged`。`PlanTask.acceptanceCommand` 才是交给 `task-run` 的结构化 `{ program, args }` argv；`detectedAcceptance` 只是仓库配置或用户输入中的候选命令提示。`planWritten` 只有在磁盘内容与本次生成内容一致（忽略 CRLF/BOM）时才为 true；`planWriteError` 记录写入失败。只有基线源码干净、Git HEAD 可读且未变化、stash 未变化、源码快照前后一致时，`sourceUnchanged` 才为 true；无法比较时为 null，发现变化时为 false。基线检查包含 staged、unstaged 和 untracked 文件（排除目标计划文件）；其他未跟踪文件也会使源码未变状态无法证明。
+workflow 返回 `PlanReport`：计划路径、mode、allowShell、shellTaskIds、任务、评审、requiresApproval、reviewedReviewHash、changedTaskIds、changeSummary、diffMarkdown、reconRequired/reconReasons、baseline/finalStatus、sourceUnchanged、detectedAcceptance、reconFailures、planWritten/planWriteError。
 
-计划产物只是快照，执行以 `plan.md` 的合同为准。批准并解决阻塞问题后运行：
+`planWritten` 只有在磁盘内容与本次生成内容一致（忽略 CRLF/BOM）时才为 true。计划产物只是快照，执行以 `plan.md` 的合同为准。
+
+批准/确认后运行：
 
 ```text
 /task-run planPath=<路径>
 ```
 
-## 安全边界
+## 硬规则
 
-`task-plan` 只允许写规范化 `.md` 计划文件，不会覆盖非计划文件或已批准计划；已有未批准计划写入失败时会尝试恢复旧内容。计划数据中出现 `TASK_RUN_CONTRACT` 保留标记会被拒绝。
-
-`task-run` 只接受固定的测试/构建工具和结构化参数，不经 shell 执行任意命令。测试脚本本身仍以当前用户权限运行，这不是操作系统沙箱。`task-run` 要求除计划文件外 Git 工作树干净，Git HEAD/stash 可读且运行期间不变；不能核验时会在改源码前拒绝或把任务判为失败。
+- 不要替用户批准计划；不要只因为文件存在就说已批准。
+- v1 合同不支持；修订模式遇到 v1 直接报错。
+- shell 只在 standard + `allowShell=true` 下允许，且必须标高风险；不要默认生成 shell。
+- 不支持的 argv 命令标 needs-info 或要求显式 allowShell，不得静默降级。
+- 不要编造 resolutions；没有用户明确决定就保留 blocking 问题。
+- 不要声称“计划里写了”等于“代码已经改了”。
+- `task-plan` 不存在时，让用户先保存 workflow，不要临时写脚本。
