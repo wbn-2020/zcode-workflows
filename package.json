@@ -1,0 +1,12 @@
+{
+  "name": "zcode-workflows",
+  "private": true,
+  "description": "Reviewed planning and execution workflows for ZCode",
+  "engines": { "node": ">=24.18.0" },
+  "scripts": {
+    "sync": "node scripts/sync-core.cjs",
+    "test": "node --test tests/*.test.cjs",
+    "check": "node scripts/check-workflows.cjs",
+    "check:host": "node scripts/check-host.cjs"
+  }
+}

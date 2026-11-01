@@ -1,129 +1,86 @@
 ---
 name: task-run
-description: Use when executing a v2 plan contract produced by task-plan. Execution mode comes only from the contract; standard defaults to non-shell argv acceptance, while shell acceptance requires explicit allowShell=true and is high risk. Enforces reviewedPlanSnapshot/reviewedReviewHash, HEAD/stash/plan integrity, task-scope snapshots, confirmationToken binding, and standard-only one-round retry. Not for planning or v1 plans.
+description: Execute a reviewed task-plan implementation package with safe dependency waves, staged changes, independent implementation review, task/stage/final checks, immutable input and source-baseline verification, and resumable evidence records. Use when the user says to implement or fix according to an existing plan, including “按刚才的方案执行”. Supports v3 packages and compatible v2 contracts. Do not re-plan or deploy implicitly.
 ---
 
-# 按计划执行（task-run）
+# task-run：按方案实现并交付
 
-执行 `task-plan` 生成的 v2 执行合同。执行模式只由合同 `mode` 决定；`task-run` 没有 `strict` 参数。不重新规划，不用模型解释 Markdown。
+用户主线：**task-plan 完成分析 → 用户审阅实施方案 → task-run 实现、复核、验收 → 用户上线测试**。
 
-- **standard**：默认 argv 验收；只允许执行前任务外脏；运行期完整性不放宽。
-- **strict**：argv 验收；执行前除 `plan.md` 外全部干净；失败立即停。
+把“按刚才的方案执行”转换成 `CreateWorkflow({ saved: { name: "task-run", args } })`。上下文只有一个方案时直接沿用路径，不要求用户手写参数；没有方案或确实有多个候选时才澄清。不要用临时脚本或普通 Agent 模拟整个执行流程。
 
-shell 验收只有计划与执行两端都显式 `allowShell=true` 才可用，且始终是高风险，不是默认行为。
+## 输入与授权
 
-## 何时使用
+- `planPath`：现有实施方案入口的 workspace 相对 `.md` 路径。
+- `approvalEvidence`：仅用户明确批准**当前 strict 版本**时传其原话；不从普通修改请求、文件存在或此前版本批准推断。
+- `grants`：用户明确授权的检查 ID 数组，例如 `["check:C-service"]`。每项只授权当前包对应检查；`permission` 字段本身不是授权。
+- `allowShell`：默认 false，仅用户明确同意 shell 检查时开启。方案和执行两端都要允许，strict 禁 shell。
+- `confirmationToken`：仅用户已经确认本轮列出的风险原因时传返回的 token，不自行生成或代确认。
+- `stopOnFailure`：默认 true；standard 可明确改 false，只继续独立且依赖成功的任务；strict 总是 fail-fast。
+- `language`：默认中文。
 
-- 用户已有 `task-plan` 生成的 v2 `plan.md`，准备执行；
-- 需要按依赖分批、逐批验收、检查文件范围和 Git 完整性；
-- 需要标准模式的一轮自动修复，或 strict 的 fail-fast。
+模式只来自合同，task-run 没有 strict 参数。standard 的运行确认是施工授权，不需要另一个“批准 JSON”操作。strict 的明确批准可直接作为执行输入，不修改不可变合同。
 
-不要用于：v1 合同、没有合同的手写 `plan.md`、未计划的需求、生产部署。
+## 执行前：整份通过再施工
 
-## 输入
+v3 校验唯一合同指针、合同/支持文件原始 UTF-8 摘要、`reviewedPlanSnapshot`、`reviewedReviewHash`、任务与阶段依赖、文件归属、检查及权限。
 
-- `planPath`（必填）：v2 `plan.md` 的 workspace 相对路径，必须是规范化 `.md`。
-- `allowShell`（可选，默认 false）：显式允许计划中的 shell 验收（高风险）；计划含 shell 任务时必须为 true。
-- `confirmationToken`（可选）：首次运行返回的确认 token；计划/评审/决议/allowShell/reasons 变化后失效。
-- `stopOnFailure`（可选，默认 true）：standard 失败后是否停止；false 只继续无依赖关系的任务。strict 合同始终 fail-fast。
-- `language`（可选）：默认中文。
+以下情况整份零施工：
+- 方案未完成、review 未 approve、缺关键调查证据或影响实施的决定未解决；
+- 计划、评审、合同或支持文件被修改；
+- 评审后的相关源码基线变化，或无法取得有效快照；
+- 缺 strict 批准、shell 双端授权或服务/远端/部署检查的明确授权；
+- 任务/检查的写范围覆盖方案包、计划入口或执行状态。
 
-## 执行前校验
+这些是硬阻塞，不能靠 confirmationToken 绕过。未决决定让 task-plan 用用户原话更新并复核，不先执行一半。
 
-在调用任何修复员前，确定性校验：
+已有 Git 仓库绑定 HEAD、branch、stash、文件内容/模式和 Git index。standard 可保留任务外的既有脏文件，但任务自身必须干净；strict 除本方案材料和入口外要求工作树干净。没有 Git 的空目录使用文件系统快照；已有 Git 但尚无首个提交时仍保留分支、索引和状态校验。不自动 git init 或创建首个提交。
 
-- 合同标记唯一、JSON 可解析、`contractVersion === 2`；v1 明确拒绝并提示重新运行 task-plan。
-- `mode` 为 standard/strict；`plan.mode` 与合同一致；`allowShell` 合法（strict 必须 false）。
-- `approvalRequired` 与 `mode`/review 一致；standard 为 false。
-- `reviewedPlanSnapshot === stableJson(plan)`；不一致硬拒绝。
-- `reviewedReviewHash === sha256(stableJson(review))`；不一致硬拒绝，提示“review 已被修改”。
-- review 结构/语义校验：字段精确、severity/taskId 合法、summary 非空。
-- `review.verdict === "reject"`：硬错误，confirmationToken 不能覆盖。
-- review 为 `approve` 但仍有 high/missing/scope/acceptance：硬错误（评审不一致）。
-- 未解决 blocking 问题影响任何 ready 任务：硬错误，token 不能覆盖；只影响 needs-info 时允许其他任务运行。
-- 依赖存在、无环；ready 不依赖非 ready；文件路径安全且不覆盖 `plan.md`。
-- 验收唯一权威字段：argv 只读 `acceptanceCommand`，shell 只读 `acceptance`，非 ready 两者都为 null。
-- 计划含 shell 任务时，执行参数 `allowShell` 必须 true；strict 不允许 shell。
-- Git 可用；HEAD、stash 可读。
+## 实现、复核、验收
 
-任何硬错误都在源码修改前拒绝整份计划，不生成 token。
+1. 依赖图和文件/父目录冲突决定安全波次；共享文件、生成器及 serial 任务不并发施工。
+2. 独立任务并行读取源码，在各自暂存目录准备 manifest 和文件副本；控制器先验证全部归属/原始摘要，再串行原子应用。不是让多个实现员直接并发改工作树。
+3. 独立复核读取实际实现、副本、任务和接口，检查行为、错误路径、资源/锁及边界。不靠实现员一句“已完成”判成功。
+4. 控制器运行合同内获授权的任务检查、阶段集成检查和最终整体检查；实现员不重复运行这些命令。
+5. standard 只对原范围内普通实现/验收缺陷修复一次，最多两次尝试；strict 在首个失败检查后停止后续检查和施工，不重试。扩大业务/接口/文件范围、缺授权、超时/缺工具/快照或完整性失败均停止，不绕过检查。
 
-## 工作树与运行期完整性
+默认非 shell `{program,args}`。standard 用危险命令黑名单，strict 用受控测试/构建参数。命令脚本仍以当前用户权限执行，黑名单和提示词不是操作系统沙箱。服务、远端操作和部署不能仅靠检查声明启用。
 
-**standard（只放宽执行前工作树）**
+## 交付与事实边界
 
-- 每个 ready 任务的 `files` 范围内不得有 staged/unstaged/untracked 改动；有则拒绝并列出文件。
-- `plan.md` 不算任务文件：允许 staged/unstaged/untracked。
-- 任务外脏文件允许，并进入基线。
-- 运行期仍然检查：HEAD、stash、plan.md 内容、`reviewedPlanSnapshot`、范围外改动。任何一项无法验证或发生变化，当前任务失败关闭。
+主交付物是执行报告，含任务状态、实际变更、每次实现与复核记录、实际检查命令/退出码/输出、失败原因、恢复路径及上线测试清单。进度看板失败不影响 `report()` 保存结果。
 
-**strict**
+只凭 exit 0 不宣称所有业务行为已通过。区分：
+- 本执行记录实际运行的机器检查；
+- 独立代码复核支持的行为；
+- 尚需用户/真实环境验证的行为。
 
-- 除 `plan.md` 外工作树干净；staged 排除 `plan.md` 后必须为空。
-- HEAD/stash 可读；同样的全量内容快照、HEAD/stash/plan 完整性检查。
+最终快照不可读或整体检查未通过，交付未完成，不标成功。实际变更以基线与有效最终快照的比较为准；未核实的空清单不等于零改动。无实施任务的诊断说明“无需施工，未运行项目验收”，不声称完成了实现复核或未配置的阶段检查。方案里的上线、迁移、回退和观察事项属于待人工执行的计划，不是已经执行的操作或新增授权。卡片发布失败说明本地报告是否已写入，不重做已经应用的代码。
 
-两种模式都不自动回滚；范围检查覆盖当前 workspace 工作树和任务范围并集内的 ignored 文件。无法读取快照时不得把“无法验证”描述为通过。
+## v3 中断与恢复
 
-## 验收
+- 每波实施/应用/检查前后保存检查点和不可变证据；已完成包再次调用，只有当前文件、包和最终快照一致才返回“已执行”，不重新施工。
+- 同一包已有非完成记录时，普通新调用不重做。读取报告里的 `checkpointPath`，核对原 run 和最后可验证步骤。
+- **恢复前在项目根目录运行 `node --disable-warning=ExperimentalWarning <本 skill 的绝对路径>/scripts/preflight.cjs <checkpointPath>`**，取得新鲜确定性核对。只有退出 0 且 `ok=true` 才 Resume/Amend；核对失败不得施工，未决更改交给用户或 task-plan 复核。
+- stopped 原样继续用 `ResumeWorkflowRun`；用户主动停止只在用户要求后恢复。provider 错误先处理原因，不擅自换模型或并发。
+- errored 或需要修脚本用 `AmendWorkflow`，先读 run 指定草稿并加载 dynamic-workflows，不重新 Create 整套任务。
+- Amend 不继承 args 时，在该 run 草稿的 `RECOVERY_CHECKPOINT_PATH3` 填检查点路径，继承原包授权、停止策略、语言、预算、已应用归属和记录；不能写固定业务 fallback，也不能借恢复扩大权限。
+- 源码已落盘但中断记录无法证明归属、最近检查仍失败、修复尚未完成、预算耗尽或串行任务处于不明确中间状态时安全停止，不能盲目重做。串行恢复必须有对应尝试的成功实施、独立复核和前后快照及摘要绑定；`appliedTaskIds` 或空结果数组不是成功证明。已失败的旧尝试可以保留，只有同 ID 后续检查已经通过才算闭环；任何完整性失败都不能被后续 exit 0 抹掉。
+- 宿主原样 Resume 重放记录，不是所有检查再次执行；对外明确“既有检查记录”和“本次现场核对”的区别。
 
-- **默认 argv**：按合同中的 `{ program, args }` 直接启动，不经 shell。只允许受限的测试/构建程序和参数；路径参数必须在 workspace 内。
-- **shell（高风险）**：仅 standard + 合同 `allowShell=true` + 执行参数 `allowShell=true`。使用黑名单和 30 分钟超时；这是显式高风险同意，不是操作系统沙箱。仓库测试/build 脚本仍以当前用户权限运行。
-- 不支持 argv 白名单的命令应在计划阶段标 needs-info 或显式 allowShell，不得静默降级。
+## 停止后如何继续
 
-## confirmationToken
+先根据报告和现场证据说明卡点，不把所有失败都当作技术中断：
+- **缺授权或决定**：只向用户说明缺少的具体内容；业务决定交回 task-plan 更新并复核，执行授权按当前包填写，不自行批准。
+- **技术中断**：按上节新鲜预检后决定能否 Resume/Amend，不能因用户说“继续”就跳过完整性门槛。
+- **范围、行为或验收需要变化**：用户要求调整时，把当前方案、执行报告和检查点路径带回 task-plan，以当前实际状态重新核对。已有改动保留，不自动重做已应用任务；新方案不豁免基线或未提交改动保护。
 
-首次运行在合同、review、Git 预检通过后：
+给出可用的自然语言下一步，不要求手工编辑 JSON，也不自动启动另一轮规划或执行。
 
-- `confirmationReasons` 只来自 high issue、missing、scopeConcerns、acceptanceConcerns；稳定排序。
-- token payload 绑定：
-  - `planHash = sha256(stableJson(plan))`
-  - `reviewHash = sha256(stableJson(review))`
-  - `resolutions`
-  - `allowShell`
-  - `reasons`
-- 无 reasons：不要求 token。
-- 有 reasons 且 token 缺失/不匹配：零修改，返回新 `confirmationToken` 和 reasons；用户确认后带 token 重跑。
-- token 匹配：执行，并在 `overrides` 记录被覆盖的 reasons。
-- **硬错误不生成 token**：review 为 reject；未解决 blocking 影响 ready；review/hash/snapshot/合同/Git/工作树校验失败；review 结构或语义不合法。
-- token 是状态绑定，不是防篡改签名。计划、评审、resolutions、allowShell 或 reasons 任一变化都会使 token 失效。
+## v2 兼容
 
-## standard 重试状态机
+合法 v2 保持原合同批准/确认规则和串行执行；ready 任务的唯一验收字段、HEAD/stash/plan 与内容快照继续校验，修复空 resolutions、快照失败重试及最终误报等边界。v2 不自动获得 v3 的安全波次、分层验收或恢复检查点；v1 和无合同手写 Markdown 不执行。
 
-1. 任务前快照 + HEAD/stash/plan 基线。
-2. fixer 第 1 次；只改任务 `files`，禁止改 plan、跑验收、git 提交/重置/切 HEAD、起服务。
-3. 修复后检查范围、HEAD、stash、plan；任一异常 → 当前任务失败，不跑验收、不重试。
-4. 验收第 1 次；验收后同样检查。
-5. 成功：exit 0 + 范围/完整性通过，attempts=1。
-6. 普通验收失败：同一 fixer 带 stdout/stderr 再修一轮；再检查范围/HEAD/stash/plan；再验收一次。成功 attempts=2；仍失败 → failed。
-7. 超时（124）、启动错误（126/127）、blocked、范围/HEAD/stash/plan 异常：不重试。
-8. `stopOnFailure=true` 停止后续；false 只继续无依赖关系的任务；下游依赖失败的任务始终跳过。
+v2 施工中断没有可供 fresh preflight 校验的完整应用归属和剩余预算，不自动 Resume/Amend 或重跑整包。先只读核对原运行和现场；确需继续时，由用户审阅后让 task-plan 针对当前实际状态生成并复核新包，不能把恢复 v3 的说明套到 v2。
 
-## strict 执行
-
-- 修复前/后/验收后三次快照，检查 HEAD/stash/plan 完整性。
-- argv 验收；不允许 shell。
-- 不自动重试；失败立即停止；`stopOnFailure=false` 在 strict 合同下不生效。
-
-## fixer prompt 上下文
-
-- 始终传入 `plan.goal`、`plan.summary`、当前任务 title/steps/behaviorAcceptance/risk/rationale。
-- `architecture=null` 时明确写“未提供（standard）”，要求按 goal/summary/任务上下文和仓库现有模式实现，不直接访问空字段。
-- `requirements=[]` 或当前任务未关联需求时，明确以 goal/summary/任务上下文为准，不访问空数组字段。
-- `technicalDecisions=[]` 时明确按仓库约定实现。
-- 传入 `resolutions` 中已确认的决策；不得自行扩大范围或改计划。
-
-## 交付
-
-`RunReport` 包含：mode、allowShell、shellTaskIds、requiresConfirmation、confirmationReasons、confirmationToken（需要确认时）、overrides、每个任务的行为验收/验收方式/命令/退出码/attempts/范围核验/改动文件/stdout/stderr、基线与最终状态、deviations、notCovered、validationErrors。
-
-自动化验收通过只证明命令退出码为 0 且范围/完整性检查通过，不等于行为验收已人工确认，也不代表生产运行时已验证。
-
-## 失败处理
-
-- `validationErrors` 非空：没有调用修复员；报告错误并让用户修订/重新生成计划。
-- 计划文件被修改/删除、HEAD 或 stash 变化、Git 不可用、快照不可读：拒绝执行或把当前任务标为失败，不得把无法验证描述为通过。
-- 依赖失败或跳过：下游任务跳过，即使 `stopOnFailure=false`。
-- 验收失败、超时、启动错误、范围检查失败：如实报告退出码、输出和变更；不自动回滚。
-- 需要确认但 token 不匹配：零修改，返回新 token。
-- v1 合同：明确拒绝，不静默降级。
-- `task-run` 不存在：让用户先保存 workflow，不要临时写脚本。
+不自动提交、推送、上线，不删除或回滚用户变更。只有暂存事务部分应用失败时，在摘要仍匹配自身写入的前提下恢复该事务自己的写入。

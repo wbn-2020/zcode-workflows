@@ -1,74 +1,94 @@
 # zcode-workflows
 
-ZCode dynamic workflows and project skills for planning and executing reviewed v2 implementation plans.
+用两个入口完成日常开发：**需求或问题 → task-plan → 实施方案 → 用户审阅 → task-run → 实现、复核与验收 → 用户上线测试**。
 
-## Included workflows
+## task-plan：本轮完成分析，再给实施方案
 
-- `task-plan` — turns a requirement, report, or findings file into a reviewable `plan.md`.
-  - **standard (default)**: lightweight plan; architecture and technical decisions are optional; automated acceptance defaults to non-shell `{ program, args }`.
-  - **strict (`strict=true`)**: full requirements, architecture, technical decisions, risk mitigation, and structured acceptance; requires explicit approval after an approving review.
-  - **revision (`changes=...`)**: natural-language edits to an existing v2 plan; mode and `allowShell` are inferred from the plan; only affected tasks are re-reviewed; new files/modules/dependencies are gated as `needs-info` or require regeneration.
-  - `allowShell=true` enables shell acceptance for standard plans only. It is high risk and never the default. Strict plans reject shell acceptance.
-  - The plan embeds a v2 JSON execution contract with `reviewedPlanSnapshot` and `reviewedReviewHash`.
-- `task-run` — executes a v2 plan contract.
-  - Execution mode comes only from the contract; there is no `strict` argument.
-  - Standard plans default to non-shell argv acceptance. Shell acceptance requires `allowShell=true` in both the plan and the run.
-  - The executor checks `reviewedPlanSnapshot`, `reviewedReviewHash`, HEAD, stash, plan-file integrity, and task-scope content snapshots.
-  - Standard allows unrelated dirty files before execution but still enforces runtime integrity. Strict requires everything except `plan.md` to be clean.
-  - Review issues that require confirmation produce a `confirmationToken`; the token binds plan hash, review hash, resolutions, `allowShell`, and confirmation reasons. Reject reviews and unresolved blocking questions are hard errors and cannot be overridden.
-  - Standard performs one automatic fix-and-reaccept round after a normal acceptance failure. Strict fails fast without retry.
+| 输入 | 本轮工作 | 交付给 task-run |
+| --- | --- | --- |
+| 产品文档、工程需求 | 理解流程和业务规则、核对仓库、必要技术选型、架构与拆解 | 实施任务 |
+| 登录卡顿、bug、性能/死锁/OOM 排查 | 实际静态调查调用链与风险区域，独立核对候选问题 | 有确认依据的修复任务 |
+| 0→1 项目、GitHub/产品参考 | 公开资料研究、需求分析、技术栈、MVP、接口与阶段设计 | 建项及阶段实现任务 |
 
-The matching project skills are under `.agents/skills/`. When this repository is used as a project or its files are copied into a workspace, ZCode can discover the workflows from `.zcode/workflows/` and skills from `.agents/skills/`.
+不默认把“以后去审查代码”当排查结果。不强求问题数；没有可确认修复项可以交付无改动结论。默认只读源码、文档和已有证据，不运行项目构建、测试、服务或压测。静态确认不是运行时复现或性能测量。
 
-## Usage
+一份可阅读的 `plan.md` 包含分析结论、方案/选型、阶段任务、文件归属、验收、风险和待确认决定。需求覆盖表列出“需求 → 任务 → 任务检查”；它展示引用关系，不代表每条业务标准都有自动化证明。作者和独立评审仍需对照原始输入核对遗漏，区分机器检查与人工验收，不能把影响实施的未知条件藏在普通假设中。详细证据、任务书、调研与评审放入支持目录，用户不必逐个组织中间步骤。
 
-1. Create a plan:
+- **可交接**：校验和评审满足条件，影响实施的决定已确定。
+- **待确认**：方案已完成，业务、兼容性、成本等决定集中等待用户审阅；整份暂不施工。
+- **未完成**：证据不足或内部修订未通过；保留材料和旧方案，不假装通过。
 
-   ```text
-   /task-plan requirement="..."
-   ```
+普通方案缺陷内部局部修订，最多三轮，交付稿另做独立复核。自然语言修改即可，不要求用户输入 `changes=`。未影响的任务、检查和旧决议由代码保留；新增文件/模块/依赖补相关调查。用户决议必须有原话依据。修订交付对比旧方案与最终方案，列出任务增改删及需求、检查、决策、范围等变化；仅修改检查导致的任务影响也会列出，摘要随方案材料绑定。
 
-   For a full plan:
+问题的确认状态由独立核对维护；新增问题、实质修改或引用证据改变后重新核对，未确认问题不能获得可执行修复任务。超限调查拆分必须覆盖原范围，遗漏会保留缺口并停止交接。尚未通过校验的初稿检查可纠正确实非法的字段，但不能借机弱化已有合法命令或扩大权限、写范围。
 
-   ```text
-   /task-plan requirement="..." strict=true
-   ```
+## 日常用法
 
-   For shell acceptance (high risk, standard only):
+```text
+/task-plan 看看 docs/订单需求.md，完成分析、必要选型和实施拆解
+/task-plan 用户反馈登录卡，沿登录链路排查问题，给出修复方案
+/task-plan 我想从零做 API 网关，参考这些 GitHub 链接，调研并设计 MVP
+```
 
-   ```text
-   /task-plan requirement="..." allowShell=true
-   ```
+审阅后：
 
-2. Review the generated `plan.md`.
-   - standard: no separate approval step; the run confirmation is the approval.
-   - strict: after an approving final review, set the contract's `approved` to `true` and record blocking-question decisions in `resolutions`.
-   - Do not edit the contract's `plan` directly. Use `changes` so the plan and review hashes are refreshed.
+```text
+/task-plan 修订刚才的方案，保留现有认证接口，采纳文档中的限流建议
+/task-run 按刚才的方案执行
+```
 
-3. Revise an existing plan with natural language:
+skill 负责从上下文选择方案路径并填写 saved workflow 参数，不额外要求用户搬运 JSON。strict 仅用户指定时启用；明确批准当前 strict 版本可直接作为执行授权，不需要手改合同。
 
-   ```text
-   /task-plan planPath=plan.md changes="T2 文件范围收窄到 src/auth，验收换成 npm run test:unit"
-   ```
+## task-run：安全波次与交付闭环
 
-4. Run it:
+v3 执行前核对整份方案、决定、批准/检查授权、计划/评审/支持材料摘要和相关源码基线。
 
-   ```text
-   /task-run planPath=plan.md
-   ```
+独立任务并行准备暂存变更，控制器核对目标归属和原始摘要，再串行原子应用。应用临时文件和回滚备份放在控制器独占创建的事务目录，全部准备并核验后才修改目标；不删除实施员目录中未知的预占文件。共享文件、父目录冲突、依赖和不适合暂存的任务串行。每个任务有独立实现复核，控制器再运行任务、阶段集成与最终整体检查。
 
-5. If the executor returns a `confirmationToken`, review the listed reasons and rerun with:
+排波和执行共用任务依赖及祖先阶段依赖。standard 设置 `stopOnFailure=false` 时，只跳过依赖未成功的任务，同波无关任务仍可继续；strict 保持首个失败即停。
 
-   ```text
-   /task-run planPath=plan.md confirmationToken=<token>
-   ```
+standard 对原范围内普通缺陷最多修复一次；strict 在首个失败检查后停止后续检查和施工，不重试。快照不可读、计划/源码漂移、缺权限或新业务决定不是普通验收失败，不能调用修复员绕过。
 
-## Contract and safety
+报告正文列出基线与有效最终快照核对得到的实际变更文件，并记录复核、检查命令/退出码/输出、每次尝试和用户上线测试清单。中断后尚未核实的空清单不表示零改动；零任务诊断明确说明无需施工、未运行项目验收。方案的上线、迁移、回退和观察事项随报告保留，标明是待人工执行的计划。exit 0 不等于所有业务行为已通过；运行时/人工验证与机器检查分开列出。不自动提交、推送或部署。
 
-- `contractVersion` is `2`; v1 contracts are rejected and must be regenerated.
-- `reviewedPlanSnapshot` detects unsynchronized plan edits. `reviewedReviewHash` detects modified reviews. They are drift checks, not tamper-proof signatures.
-- `confirmationToken` binds plan hash, review hash, resolutions, `allowShell`, and reasons. It is a state binding, not an authentication token.
-- Shell acceptance is not an operating-system sandbox. Repository test/build scripts still run with the current user's privileges.
-- `task-run` does not auto-rollback. Out-of-scope changes fail the current task and are reported.
-- Standard only relaxes the pre-run worktree: unrelated dirty files may remain, but the task's own files must be clean and all runtime integrity checks stay enabled.
-- Global copies live in `~/.zcode/workflows/` and `~/.agents/skills/`. The repository copies are the source of truth and should be synced there after validation.
+## 合同、权限与兼容
+
+- v3 人类文档只放短合同指针；完整执行数据保存在 `.zcode/task-plans/<输入摘要>/v-<内容摘要>/`。
+- `reviewedPlanSnapshot` 使用排序 JSON；`reviewedReviewHash` 校验评审。合同指针及支持文件使用**原始 UTF-8 文件内容 SHA-256**，不是 JSON 归一后的摘要。
+- standard 默认非 shell `{program,args}`，使用危险命令黑名单；strict 使用受控测试/构建参数。shell 需要方案和执行双端明确同意，属于高风险。
+- `check.permission` 不是授权。服务、远端操作或部署检查要由用户明确授权当前包的具体 `check:<id>`。没有授权不能先执行部分任务。
+- token 只绑定当前方案和确认原因，不能覆盖 reject、篡改、缺证据、未决实施决定或基线冲突；摘要/token 不是签名。
+- Git 项目保留 HEAD、branch、stash、Git index、文件内容与模式校验；standard 只允许任务外既有脏文件，strict 要求工作树干净（本方案材料/入口除外）。没有 Git 的空目录使用文件系统快照；已有 Git 但尚无首个提交时仍保留分支、索引和状态校验，不自动初始化或提交 Git。
+- 合法 v2 保留原执行策略与串行兼容；v3 才有新方案包、波次和分层验收。v1 和无合同手写 Markdown 不执行。
+- 路径、文件摘要和暂存归属校验不是 OS 沙箱。项目检查和允许的解释器仍以当前用户权限执行。
+
+## 中断与恢复
+
+分析材料与执行证据随阶段持久化并 `report()`，最终步骤失败不会丢全部前序成果。大方案以文件型产物交付，避免 Markdown 卡片上限；文件成功和卡片成功分别记录。
+
+v3 恢复前，skill 用随附 `scripts/preflight.cjs` 在项目根目录新鲜核对检查点、方案包和现场源码。stopped 原样继续用 Resume；脚本错误用 Amend。Amend 缺 args 时从检查点记录恢复原输入、授权、停止策略、语言、预算和已应用归属，不写项目专用 fallback。
+
+串行应用归属只在实施成功、独立复核通过及范围完整性核对后登记。恢复预检和执行器共同核对该次实施、复核、前后快照的归属及原始摘要；`appliedTaskIds` 或空结果数组不能替代成功证据，blocked、拒审和证据缺失不会经恢复变为成功。
+
+宿主 Resume 会重放已经记录的检查，不代表再次验证现场。已执行包只有现场与最终快照一致才返回“已执行”，不再次施工。无法证明中断状态、存在用户漂移、最近检查仍失败或预算耗尽时安全停止。v2 没有这套恢复检查点；施工中断先只读核对原记录和当前源码，不自动 Resume/Amend 或重跑整包。
+
+停止后的下一步按原因区分：缺授权或业务决定由用户补充；技术中断只有新鲜预检通过后才恢复；范围、行为或验收变化由 task-plan 结合当前方案、执行报告和检查点重新核对。用户仍用自然语言表达意图，不需手工搬运 JSON。已有改动保留，新方案不豁免源码基线或未提交改动保护；不自动启动下一轮规划或执行。
+
+## 开发与验证
+
+源码：`.zcode/workflows/`；skills：`.agents/skills/`。全局安装位置：`~/.zcode/workflows/` 和 `~/.agents/skills/`。项目中的同名副本可能优先于全局版本。
+
+saved workflow 是自包含脚本，无运行时仓库 import。开发时维护 `_task-core.ts` 和标准库辅助程序，由同步脚本嵌入两个定义：
+
+```text
+npm run sync
+npm test
+npm run check
+npm run check:host
+```
+
+测试加载当前源码，使用纯函数、mock 和隔离临时目录，不启动真实 task-run、不运行用户业务测试/服务。`npm run check` 做语法和官方 facade 严格类型检查；`npm run check:host` 提取已复核宿主 bundle 的内部编译依赖，在受限 VM 中检查 analyzer、ask schema 和 lowering，生成代码只做语法检查，不执行工作流。
+
+宿主检查使用非公开 API，并绑定 bundle 摘要；宿主升级后会拒绝，需重新复核。它不验证模型可用性、实际模型输出或运行期权限。可用 `ZCODE_HOST_BUNDLE` 指定宿主 bundle。
+
+Node 需 24.18 或更新。类型检查需要可用 TypeScript；可通过 `ZCODE_TYPESCRIPT` 指定其安装位置，`ZCODE_WORKFLOW_SKILL` 指定官方技能文件。运行模型/网络/宿主仍可能中断，本实现提供保存成果和安全恢复，不保证永不中断或上线零缺陷。
